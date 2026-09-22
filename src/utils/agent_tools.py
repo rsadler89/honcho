@@ -1593,6 +1593,25 @@ def _normalize_observation_id(obs_id: str) -> str:
     return obs_id.strip()
 
 
+def _coerce_raw_observation(raw: Any) -> dict[str, Any] | None:
+    """Coerce one model-supplied ``observations`` element into a mutable dict.
+
+    The tool schema declares the array items as objects, but models sometimes
+    emit bare strings (``{"observations": ["fact one", "fact two"]}``). A
+    string is recoverable — it is the observation's content — so it is wrapped
+    rather than dropped. A dict is returned unchanged (same object, so the
+    caller's in-place level/source_ids fixups still apply to the model's own
+    payload). Anything else (None, numbers, nested lists) carries no usable
+    content: returns None for the caller to report as a failure. Content
+    stripping is left to ``_normalized_observation_input`` at persistence time.
+    """
+    if isinstance(raw, dict):
+        return cast(dict[str, Any], raw)
+    if isinstance(raw, str):
+        return {"content": raw}
+    return None
+
+
 async def _latest_source_timestamp(
     ctx: ToolContext,
     observations: list[schemas.ObservationInput],
@@ -1651,9 +1670,51 @@ async def _handle_create_observations_impl(
     if not raw_observations:
         return "ERROR: observations list is empty"
 
+    # A non-list here is not recoverable element-wise: iterating a str yields
+    # characters and iterating a dict yields its keys, either of which would
+    # silently mint garbage observations once elements are coerced below.
+    if not isinstance(raw_observations, list):
+        return (
+            "ERROR: 'observations' must be a list of observation objects, got "
+            f"{type(raw_observations).__name__}"
+        )
+
+    validation_failures: list[ObservationFailure] = []
+
+    # Elements come straight from the model, so their shape is not guaranteed
+    # even though the tool schema declares objects. Coerce what is recoverable
+    # and report the rest — one malformed element must not abort the batch.
+    prepared_observations: list[dict[str, Any]] = []
+    coerced_count = 0
     # Set context-specific default level before Pydantic validation
     default_level = "explicit" if ctx.current_messages else "deductive"
-    for obs in raw_observations:
+    for raw_obs in cast(list[Any], raw_observations):
+        obs = _coerce_raw_observation(raw_obs)
+        if obs is None:
+            logger.warning(
+                "Skipping unusable observation element of type %s in %s (observer=%s, "
+                "observed=%s, agent=%s, run_id=%s): %.100r",
+                type(raw_obs).__name__,
+                ctx.workspace_name,
+                ctx.observer,
+                ctx.observed,
+                ctx.agent_type,
+                ctx.run_id,
+                raw_obs,
+            )
+            validation_failures.append(
+                ObservationFailure(
+                    content_preview=str(raw_obs)[:50],
+                    error=(
+                        "Expected an observation object, got "
+                        f"{type(raw_obs).__name__}; each item must be an object "
+                        "with a 'content' field"
+                    ),
+                )
+            )
+            continue
+        if isinstance(raw_obs, str):
+            coerced_count += 1
         if forced_level is not None:
             obs["level"] = forced_level
         else:
@@ -1667,10 +1728,23 @@ async def _handle_create_observations_impl(
                 if isinstance(source_id, str):
                     normalized_source_ids.append(_normalize_observation_id(source_id))
             obs["source_ids"] = normalized_source_ids
+        prepared_observations.append(obs)
+
+    if coerced_count:
+        logger.warning(
+            "Coerced %d bare-string observation(s) to content objects in %s "
+            "(observer=%s, observed=%s, agent=%s, run_id=%s)",
+            coerced_count,
+            ctx.workspace_name,
+            ctx.observer,
+            ctx.observed,
+            ctx.agent_type,
+            ctx.run_id,
+        )
+
     # Validate observations individually so valid ones are still processed
     observations: list[schemas.ObservationInput] = []
-    validation_failures: list[ObservationFailure] = []
-    for obs in raw_observations:
+    for obs in prepared_observations:
         try:
             validated = schemas.ObservationInput.model_validate(obs)
         except ValidationError as e:

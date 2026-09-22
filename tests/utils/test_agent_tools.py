@@ -29,7 +29,10 @@ from src.utils.agent_tools import (
     ObservationsCreatedResult,
     ToolContext,
     _bounded_int,  # pyright: ignore[reportPrivateUsage]
+    _coerce_raw_observation,  # pyright: ignore[reportPrivateUsage]
     _handle_create_observations,  # pyright: ignore[reportPrivateUsage]
+    _handle_create_observations_deductive,  # pyright: ignore[reportPrivateUsage]
+    _handle_create_observations_inductive,  # pyright: ignore[reportPrivateUsage]
     _handle_delete_observations,  # pyright: ignore[reportPrivateUsage]
     _handle_extract_preferences,  # pyright: ignore[reportPrivateUsage]
     _handle_finish_consolidation,  # pyright: ignore[reportPrivateUsage]
@@ -831,6 +834,247 @@ class TestCreateObservations:
 
         assert isinstance(result, ObservationsCreatedResult)
         assert captured["deduplicate"] is deduplicate_setting
+
+    async def test_bare_string_observations_coerced_to_content(
+        self,
+        db_session: AsyncSession,
+        tool_test_data: Any,
+        make_tool_context: Callable[..., ToolContext],
+    ):
+        """Models sometimes emit `observations` as bare strings despite the
+        object schema. A string is the observation's content, so it is wrapped
+        rather than dropped — and the level default still applies to it."""
+        workspace, peer1, peer2, _session, messages, _ = tool_test_data
+        ctx = make_tool_context(current_messages=messages)
+
+        result = await _handle_create_observations(
+            ctx,
+            {"observations": ["Ships on Fridays", "Keeps a standing desk"]},
+        )
+
+        assert "Created 2 observations" in result
+        # setdefault ran on the coerced dicts: deriver context defaults explicit
+        assert "2 explicit" in result
+
+        stmt = select(models.Document).where(
+            models.Document.workspace_name == workspace.name,
+            models.Document.observer == peer1.name,
+            models.Document.observed == peer2.name,
+            models.Document.content.in_(["Ships on Fridays", "Keeps a standing desk"]),
+        )
+        docs = (await db_session.execute(stmt)).scalars().all()
+        assert len(docs) == 2
+        assert all(doc.level == "explicit" for doc in docs)
+
+    @pytest.mark.parametrize(
+        "handler,expected_level",
+        [
+            # forced_level path: `obs["level"] = forced_level` is what raised
+            # TypeError on a bare string in production.
+            (_handle_create_observations_inductive, "inductive"),
+            (_handle_create_observations_deductive, "deductive"),
+            # forced_level=None path: `obs.setdefault("level", default_level)`,
+            # which defaults to deductive without current_messages.
+            (_handle_create_observations, "deductive"),
+        ],
+    )
+    async def test_bare_string_observations_rejected_not_crashed_when_sources_required(
+        self,
+        db_session: AsyncSession,
+        make_tool_context: Callable[..., ToolContext],
+        handler: Callable[..., Any],
+        expected_level: str,
+    ):
+        """The production crash: a bare-string array reached
+        `obs["level"] = forced_level` and raised
+        `TypeError: 'str' object does not support item assignment`.
+
+        The string is now coerced and carried into normal validation. A derived
+        level still requires source_ids, which a bare string cannot supply, so
+        these are reported back to the model rather than persisted — the point
+        is that the call returns an actionable error instead of aborting the
+        dream.
+        """
+        ctx = make_tool_context(current_messages=None)
+
+        result = await handler(
+            ctx,
+            {
+                "observations": [
+                    "peer works on WP-1 U1",
+                    "peer has an SSD mounted at /Volumes/Extreme SSD",
+                ]
+            },
+        )
+
+        assert isinstance(result, str)
+        assert "ERROR" in result
+        # The level was applied to the coerced dict, so the rejection is the
+        # level's own source_ids requirement.
+        assert f"{expected_level} observations require 'source_ids'" in result
+        # The string survived as content rather than being discarded.
+        assert "peer works on WP-1 U1" in result
+
+        stmt = select(models.Document).where(
+            models.Document.content.in_(
+                [
+                    "peer works on WP-1 U1",
+                    "peer has an SSD mounted at /Volumes/Extreme SSD",
+                ]
+            )
+        )
+        docs = (await db_session.execute(stmt)).scalars().all()
+        assert len(docs) == 0
+
+    async def test_mixed_observation_shapes_keep_valid_and_report_unsalvageable(
+        self,
+        db_session: AsyncSession,
+        tool_test_data: Any,
+        make_tool_context: Callable[..., ToolContext],
+    ):
+        """One malformed element must not abort the batch: dicts and strings
+        are processed, and elements that carry no content are reported."""
+        workspace, peer1, peer2, _session, messages, _ = tool_test_data
+        ctx = make_tool_context(current_messages=messages)
+
+        result = await _handle_create_observations(
+            ctx,
+            {
+                "observations": [
+                    {"content": "Drinks espresso", "level": "explicit"},
+                    "Runs before sunrise",
+                    None,
+                    ["nested", "list"],
+                ]
+            },
+        )
+
+        assert "Created 2 observations" in result
+        assert "2 explicit" in result
+        assert "Failed 2" in result
+        assert "NoneType" in str(result)
+        assert "list" in str(result)
+
+        stmt = select(models.Document).where(
+            models.Document.workspace_name == workspace.name,
+            models.Document.observer == peer1.name,
+            models.Document.observed == peer2.name,
+            models.Document.content.in_(["Drinks espresso", "Runs before sunrise"]),
+        )
+        docs = (await db_session.execute(stmt)).scalars().all()
+        assert len(docs) == 2
+
+    async def test_all_unsalvageable_observations_return_error_without_crash(
+        self,
+        make_tool_context: Callable[..., ToolContext],
+    ):
+        """A batch with nothing salvageable reports every skipped element
+        through the existing failure channel instead of raising."""
+        ctx = make_tool_context(current_messages=None)
+
+        result = await _handle_create_observations(
+            ctx, {"observations": [None, 42, ["nested"]]}
+        )
+
+        assert isinstance(result, str)
+        assert "All observations failed validation" in result
+        for type_name in ("NoneType", "int", "list"):
+            assert type_name in result
+
+    @pytest.mark.parametrize(
+        "bad_observations",
+        ["a bare string instead of a list", {"content": "a bare object"}],
+    )
+    async def test_non_list_observations_rejected(
+        self,
+        db_session: AsyncSession,
+        tool_test_data: Any,
+        make_tool_context: Callable[..., ToolContext],
+        bad_observations: Any,
+    ):
+        """`observations` itself must be a list. Iterating a str yields
+        characters and iterating a dict yields its keys, so coercing elements
+        of a non-list would mint garbage observations."""
+        workspace, peer1, peer2, _session, _messages, documents = tool_test_data
+        ctx = make_tool_context(current_messages=None)
+
+        result = await _handle_create_observations(
+            ctx, {"observations": bad_observations}
+        )
+
+        assert isinstance(result, str)
+        assert "ERROR" in result
+        assert "must be a list" in result
+
+        # Nothing was written: only the fixture's documents remain.
+        stmt = select(models.Document).where(
+            models.Document.workspace_name == workspace.name,
+            models.Document.observer == peer1.name,
+            models.Document.observed == peer2.name,
+        )
+        docs = (await db_session.execute(stmt)).scalars().all()
+        assert len(docs) == len(documents)
+
+    async def test_dict_observations_unaffected_by_shape_guard(
+        self,
+        db_session: AsyncSession,
+        tool_test_data: Any,
+        make_tool_context: Callable[..., ToolContext],
+    ):
+        """No-regression: dict elements still get the default level and the
+        source_ids `id:` prefix stripped, exactly as before the shape guard."""
+        *_, documents = tool_test_data
+        ctx = make_tool_context(current_messages=None)
+
+        result = await _handle_create_observations(
+            ctx,
+            {
+                "observations": [
+                    {
+                        "content": "Inferred a preference for deep work blocks",
+                        "source_ids": [f"id:{documents[0].id}", documents[1].id],
+                        "premises": ["User avoids afternoon meetings"],
+                    },
+                ]
+            },
+        )
+
+        assert "Created 1 observations" in result
+        assert "1 deductive" in result
+
+        stmt = select(models.Document).where(
+            models.Document.content == "Inferred a preference for deep work blocks"
+        )
+        doc = (await db_session.execute(stmt)).scalar_one_or_none()
+        assert doc is not None
+        assert doc.level == "deductive"
+        assert doc.source_ids == [documents[0].id, documents[1].id]
+
+
+class TestCoerceRawObservation:
+    """Unit tests for _coerce_raw_observation."""
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ({"content": "already an object"}, {"content": "already an object"}),
+            ({}, {}),
+            ("a bare string", {"content": "a bare string"}),
+            ("", {"content": ""}),
+            (None, None),
+            (42, None),
+            (["nested"], None),
+            (("tuple",), None),
+        ],
+    )
+    def test_coercion(self, raw: Any, expected: dict[str, Any] | None):
+        assert _coerce_raw_observation(raw) == expected
+
+    def test_dict_is_returned_unchanged_for_in_place_mutation(self):
+        """Dicts must come back as the same object so the caller's level and
+        source_ids fixups apply to the model's own payload."""
+        raw: dict[str, Any] = {"content": "an observation"}
+        assert _coerce_raw_observation(raw) is raw
 
 
 class TestNormalizeObservationId:
