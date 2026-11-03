@@ -1359,7 +1359,10 @@ class DreamSettings(HonchoSettings):
     MAX_ENQUEUED_PER_POLL: Annotated[int, Field(default=100, gt=0, le=10_000)] = 100
     ENABLED_TYPES: list[str] = ["omni"]
 
-    # Agent iteration limit - increased for extended reasoning workflow
+    # Agent tool-iteration limit shared by the dream specialists. Each
+    # specialist honors this value up to its own MAX_ITERATIONS_CEILING
+    # (deduction 24, induction 20, card_refresh 6). Raising this above a
+    # specialist's ceiling has no effect on that specialist.
     MAX_TOOL_ITERATIONS: Annotated[int, Field(default=20, gt=0, le=50)] = 20
 
     # Token limit for get_recent_history tool within the agent

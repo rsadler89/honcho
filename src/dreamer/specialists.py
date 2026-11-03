@@ -535,6 +535,11 @@ class DeductionSpecialist(BaseSpecialist):
     name: str = "deduction"
     peer_card_update_instruction: str = "Update this with `update_peer_card` only for stable identity markers. See the PEER CARD section in the system prompt for the allowed entry kinds and rules."
 
+    # Upper bound applied when the operator raises DREAM_MAX_TOOL_ITERATIONS
+    # above it; the configured value is honored below the ceiling. Mirrors
+    # CardRefreshSpecialist so the configured limit governs every specialist.
+    MAX_ITERATIONS_CEILING: int = 24
+
     def get_tools(self, *, peer_card_enabled: bool = True) -> list[dict[str, Any]]:
         if peer_card_enabled:
             return DEDUCTION_SPECIALIST_TOOLS
@@ -554,7 +559,7 @@ class DeductionSpecialist(BaseSpecialist):
         return 8192
 
     def get_max_iterations(self) -> int:
-        return 12
+        return min(self.MAX_ITERATIONS_CEILING, settings.DREAM.MAX_TOOL_ITERATIONS)
 
     def build_system_prompt(
         self, observed: str, *, peer_card_enabled: bool = True
@@ -673,6 +678,10 @@ class InductionSpecialist(BaseSpecialist):
     # Induction never writes to the peer card; behavioral patterns are observations.
     can_update_peer_card: bool = False
 
+    # Upper bound applied when the operator raises DREAM_MAX_TOOL_ITERATIONS
+    # above it; the configured value is honored below the ceiling.
+    MAX_ITERATIONS_CEILING: int = 20
+
     def get_tools(self, *, peer_card_enabled: bool = True) -> list[dict[str, Any]]:
         _ = peer_card_enabled
         return INDUCTION_SPECIALIST_TOOLS
@@ -687,7 +696,7 @@ class InductionSpecialist(BaseSpecialist):
         return 8192
 
     def get_max_iterations(self) -> int:
-        return 10
+        return min(self.MAX_ITERATIONS_CEILING, settings.DREAM.MAX_TOOL_ITERATIONS)
 
     def build_system_prompt(
         self, observed: str, *, peer_card_enabled: bool = True
